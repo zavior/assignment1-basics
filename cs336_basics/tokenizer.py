@@ -13,9 +13,9 @@ class Tokenizer:
         self.merges = merges
         self.ranked_merges = {merge: i for i, merge in enumerate(merges)}
         self.special_tokens = special_tokens or []
-        # if self.special_tokens:
-        self.special_tokens = sorted(self.special_tokens, key=len, reverse=True)
-        self.pattern = re.compile("|".join(re.escape(t) for t in self.special_tokens))
+        if self.special_tokens:
+            self.special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+            self.pattern = re.compile("|".join(re.escape(t) for t in self.special_tokens))
         self.cache = {}
 
     @classmethod
@@ -42,7 +42,9 @@ class Tokenizer:
         special_tokens: list[str] | None = None
         """
         with open(cpickle_filepath, "rb") as f:
-            vocab, merges = pickle.load(f)
+            tmp = pickle.load(f)
+            vocab = tmp["vocab"]
+            merges = tmp["merges"]
         return cls(vocab, merges, special_tokens)
     
     def _encode_word(self, word: bytes) -> list[int]:
