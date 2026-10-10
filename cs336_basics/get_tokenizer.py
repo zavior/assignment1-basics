@@ -1,4 +1,4 @@
-import os, sys, cpickle
+import os, sys, pickle
 import regex as re
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
@@ -11,6 +11,7 @@ class Tokenizer:
         self.vocab = vocab
         self.bytes_to_id = {v: k for k, v in vocab.items()}
         self.merges = merges
+        self.ranked_merges = {merge: i for i, merge in enumerate(merges)}
         self.special_tokens = special_tokens or []
         # if self.special_tokens:
         self.special_tokens = sorted(self.special_tokens, key=len, reverse=True)
@@ -41,7 +42,7 @@ class Tokenizer:
         special_tokens: list[str] | None = None
         """
         with open(cpickle_filepath, "rb") as f:
-            vocab, merges = cpickle.load(f)
+            vocab, merges = pickle.load(f)
         return cls(vocab, merges, special_tokens)
     
     def _encode_word(self, word: bytes) -> list[int]:
@@ -54,22 +55,52 @@ class Tokenizer:
         # print(f"Initial tokens for word {word}: {tokens}")
 
         # Apply merges
-        for merge in self.merges:
-            merged_token = merge[0] + merge[1]
-            # if merged_token in self.vocab: # necessary?
-            # print(f"Current tokens: {tokens}")
-            # print(f"Applying merge: {merge} -> {merged_token}")
+
+        # naive implementation of BPE merge operations
+        # for merge in self.merges:
+        #     merged_token = merge[0] + merge[1]
+        #     # if merged_token in self.vocab: # necessary?
+        #     # print(f"Current tokens: {tokens}")
+        #     # print(f"Applying merge: {merge} -> {merged_token}")
+        #     new_tokens = []
+        #     i = 0
+        #     while i < len(tokens):
+        #         if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == (merge[0], merge[1]):
+        #             new_tokens.append(merged_token)
+        #             i += 2
+        #         else:
+        #             new_tokens.append(tokens[i])
+        #             i += 1
+
+        #     tokens = new_tokens
+
+        # optimized implementation of BPE merge operations
+        while len(tokens) > 1:
+            pairs = [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+
+            best_rank = -1
+            best_pair = None
+            for pair in pairs:
+                pair_rank = self.ranked_merges.get(pair, -1)
+                if pair_rank != -1 and (best_rank == -1 or pair_rank < best_rank):
+                    best_rank = pair_rank
+                    best_pair = pair
+
+            if not best_pair:
+                break
+
             new_tokens = []
             i = 0
             while i < len(tokens):
-                if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == (merge[0], merge[1]):
-                    new_tokens.append(merged_token)
+                if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == best_pair:
+                    new_tokens.append(best_pair[0] + best_pair[1])
                     i += 2
                 else:
                     new_tokens.append(tokens[i])
                     i += 1
 
             tokens = new_tokens
+
         return [self.bytes_to_id[t] for t in tokens]
 
     def encode_without_special_tokens(self, text : str, start: int, end: int) -> list[int]:
