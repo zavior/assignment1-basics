@@ -1,5 +1,6 @@
 import os, sys, pickle
 import regex as re
+from multiprocessing import Pool
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
@@ -158,6 +159,62 @@ class Tokenizer:
                     buffer = buffer[-1] + line
         yield from self.encode(buffer) # yield the last buffer
 
+    def _find_chunk_boundaries(self, file_path: str | os.PathLike, desired_num_chunk: int) -> list[int]:
+        if self.special_tokens:
+            split_pat = re.compile(b"|".join(re.escape(token.encode("utf-8")) for token in self.special_tokens))
+            overlap = max(len(token.encode("utf-8")) for token in self.special_tokens)         
+        else:
+            split_pat = re.compile(rb"\s(?=\S)")
+            overlap = 1
+
+        with open(file_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            f.seek(0)
+            chunk_size = file_size // desired_num_chunk
+            boundaries = [i * chunk_size for i in range(desired_num_chunk + 1)]
+            boundaries[-1] = file_size
+
+            mini_chunk_size = 4096
+
+            for bi in range(1, len(boundaries) - 1):
+                pos = boundaries[bi]
+                
+                while True:
+                    f.seek(pos)
+                    mini_chunk = f.read(mini_chunk_size + overlap)
+                    if mini_chunk == b"":
+                        boundaries[bi] = file_size
+                        break
+
+                    match = split_pat.search(mini_chunk)
+                    if match:
+                        boundaries[bi] = pos + match.start()
+                        break
+                    if len(mini_chunk) < overlap:
+                        boundaries[bi] = file_size
+                        break
+                    pos += mini_chunk_size
+
+        return sorted(set(boundaries))
+    def _encode_for_parallel(self, file_path: str | os.PathLike, start: int, end: int) -> list[int]:
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            return self.encode(chunk)
+
+    def encode_file_parallel(self, file_path: str | os.PathLike, num_processes: int = 4) -> list[int]:
+        boundaries = self._find_chunk_boundaries(file_path, num_processes)
+
+        ret = []
+
+        with Pool(num_processes) as pool:
+            results = pool.starmap(self._encode_for_parallel, [(file_path, start, end) for start, end in zip(boundaries, boundaries[1:])])
+            for r in results:
+                ret.extend(r)
+
+        return ret
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -265,6 +322,114 @@ if __name__ == "__main__":
     import types
     check("iterable | returns generator",
           isinstance(tok_sp.encode_iterable(io.StringIO("a")), types.GeneratorType), True)
+ 
+    # ---------- 3. encode_file_parallel：结果应与 encode(全文) 一致 ----------
+    import tempfile, pathlib, random
+ 
+    EOT = "<|endoftext|>"
+ 
+    # 字节级词表：256 个单字节 + 若干 merge（含中文多字节、"\n\n"），保证任意 UTF-8 文本都能编码
+    byte_vocab = {i: bytes([i]) for i in range(256)}
+    byte_merges = []
+    for a, b in [(b't', b'h'), (b'th', b'e'), (b' ', b't'), (b' t', b'he'), (b' ', b'c'),
+                 (b' c', b'a'), (b' ca', b't'), (b'\n', b'\n'),
+                 ("你".encode()[:2], "你".encode()[2:]), ("好".encode()[:2], "好".encode()[2:])]:
+        byte_merges.append((a, b))
+        byte_vocab[len(byte_vocab)] = a + b
+    byte_vocab[len(byte_vocab)] = EOT.encode()
+    byte_vocab[len(byte_vocab)] = b"<|pad|>"
+ 
+    btok_sp = get_tokenizer(byte_vocab, byte_merges, [EOT])
+    btok_multi = get_tokenizer(byte_vocab, byte_merges, [EOT, "<|pad|>"])
+    btok_plain = get_tokenizer(byte_vocab, byte_merges)
+ 
+    def make_corpus(n_docs: int, seed: int = 0) -> str:
+        """随机生成 n_docs 篇文档，用 EOT 分隔；内容覆盖空格、换行、空行、中文、标点、数字"""
+        rng = random.Random(seed)
+        words = ["the", "cat", "ate", " ", "\n", "\n\n", "你好", "世界", "!", "123", "it's", "  ", "\t"]
+        docs = ["".join(rng.choice(words) + rng.choice(["", " "]) for _ in range(rng.randint(0, 40)))
+                for _ in range(n_docs)]
+        return EOT.join(docs)
+ 
+    tmpdir = tempfile.TemporaryDirectory()
+ 
+    def write_tmp(name: str, text: str) -> pathlib.Path:
+        p = pathlib.Path(tmpdir.name) / name
+        p.write_bytes(text.encode("utf-8"))  # 用 bytes 写，避免 Windows 换行转换
+        return p
+ 
+    def run_parallel(name, tok, text, num_processes):
+        path = write_tmp(f"{abs(hash(name))}.txt", text)
+        try:
+            got = tok.encode_file_parallel(path, num_processes=num_processes)
+        except NotImplementedError:
+            got = "NotImplementedError"
+        except Exception as e:
+            got = f"{type(e).__name__}: {e}"
+        check(f"parallel | {name} | np={num_processes}", got, tok.encode(text))
+        if isinstance(got, list):
+            check(f"par-rt   | {name} | np={num_processes}", tok.decode(got), text)
+ 
+    big = make_corpus(300, seed=1)
+    parallel_cases = [
+        # 含 special token
+        ("sp | small corpus",                 btok_sp,    make_corpus(5)),
+        ("sp | big corpus",                   btok_sp,    big),
+        ("sp | special at start & end",       btok_sp,    EOT + "the cat" + EOT),
+        ("sp | consecutive specials",         btok_sp,    "the" + EOT * 5 + "cat"),
+        ("sp | only special",                 btok_sp,    EOT),
+        ("sp | blank lines around special",   btok_sp,    "the\n\n" + EOT + "\n\n\ncat\n\n"),
+        ("sp | multibyte around special",     btok_sp,    "你好" + EOT + "世界" + EOT + "你好"),
+        ("sp | single doc, no special inside", btok_sp,   "the cat ate\n\nthe cat " * 50),
+        ("sp | multiple special tokens",      btok_multi, "the<|pad|>cat" + EOT + "ate<|pad|><|pad|>" + EOT),
+        # 不含 special token（tokenizer 本身没配置）
+        ("no-sp | plain text",                btok_plain, "the cat ate\n\nthe 你好 cat\n" * 30),
+        ("no-sp | eot is plain text here",    btok_plain, "the" + EOT + "cat"),
+        # 边界
+        ("edge | empty file",                 btok_sp,    ""),
+        ("edge | single char",                btok_sp,    "t"),
+    ]
+    for name, tok, text in parallel_cases:
+        for np_ in (1, 2, 4):
+            run_parallel(name, tok, text, np_)
+ 
+    # 进程数远大于文档数
+    run_parallel("edge | processes >> docs", btok_sp, "the" + EOT + "cat", 16)
+ 
+    # 不同进程数结果完全一致（确定性）
+    p_big = write_tmp("big.txt", big)
+    try:
+        results = [btok_sp.encode_file_parallel(p_big, num_processes=n) for n in (1, 2, 3, 4, 8)]
+        check("parallel | deterministic across num_processes", all(r == results[0] for r in results), True)
+    except Exception as e:
+        check("parallel | deterministic across num_processes", f"{type(e).__name__}", "no error")
+ 
+    # 路径支持 str 和 pathlib.Path
+    for kind, arg in [("str", str(p_big)), ("Path", p_big)]:
+        try:
+            got = btok_sp.encode_file_parallel(arg, num_processes=2)
+            check(f"parallel | path as {kind}", got, btok_sp.encode(big))
+        except Exception as e:
+            check(f"parallel | path as {kind}", f"{type(e).__name__}", "no error")
+ 
+    # 返回类型 list[int]
+    try:
+        got = btok_sp.encode_file_parallel(p_big, num_processes=2)
+        check("parallel | returns list[int]",
+              isinstance(got, list) and all(isinstance(x, int) for x in got), True)
+    except Exception as e:
+        check("parallel | returns list[int]", f"{type(e).__name__}", "no error")
+ 
+    # 文件不存在
+    try:
+        btok_sp.encode_file_parallel(pathlib.Path(tmpdir.name) / "missing.txt", num_processes=2)
+        check("parallel | missing file -> FileNotFoundError", "no error", "FileNotFoundError")
+    except FileNotFoundError:
+        check("parallel | missing file -> FileNotFoundError", "FileNotFoundError", "FileNotFoundError")
+    except Exception as e:
+        check("parallel | missing file -> FileNotFoundError", type(e).__name__, "FileNotFoundError")
+ 
+    tmpdir.cleanup()
  
     print("====" * 10)
     print(f"{passed} passed, {failed} failed")
