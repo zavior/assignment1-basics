@@ -160,6 +160,11 @@ class Tokenizer:
             else:
                 if blank_pattern.fullmatch(line[0]):
                     buffer += line
+                elif any(line.startswith(t) for t in self.special_tokens):  # [BUGFIX]
+                    # 新行以 special token 开头：encode 会先切出 special，buffer 末尾的空白就是这段文本的结尾，
+                    # 整段空白（如 "\n\n"）是一个 pre-token，不能像下面那样把最后一个字符拆给下一段
+                    yield from self.encode(buffer)
+                    buffer = line
                 else: # if the line does not start with a blank, yield the encoded buffer and start a new buffer
                     yield from self.encode(buffer[:-1])
                     buffer = buffer[-1] + line
@@ -319,6 +324,9 @@ if __name__ == "__main__":
         ("sp    | adjacent specials",           "a<|endoftext|><|endoftext|>b"),
         ("sp    | special + blank lines",       "the<|endoftext|>\n\n\ncat\n"),
         ("sp    | only special",                "<|endoftext|>"),
+        # [BUGFIX] 多个空白行后紧跟以 special 开头的行：原实现会把 "\n\n" 拆成 "\n" + "\n"
+        ("sp    | blank lines then special line",  "a\n\n<|endoftext|>b"),
+        ("sp    | spaces+newlines then special",   "the \n \n\n<|endoftext|>cat\n\n\n<|endoftext|>"),
     ]
     for name, text in iterable_cases:
         expected = tok_sp.encode(text)
