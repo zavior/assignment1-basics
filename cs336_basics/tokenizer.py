@@ -1,6 +1,7 @@
 import os, sys, pickle
 import regex as re
 from multiprocessing import Pool
+from functools import lru_cache
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
@@ -8,7 +9,10 @@ class Tokenizer:
     """
     A simple tokenizer class that can be used to tokenize text based on a given vocabulary and merges.
     """
-    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+    def __init__(self, vocab: dict[int, bytes], 
+                 merges: list[tuple[bytes, bytes]], 
+                 special_tokens: list[str]  | None = None,
+                  cache_size: int = 300_000):
         self.vocab = vocab
         self.bytes_to_id = {v: k for k, v in vocab.items()}
         self.merges = merges
@@ -17,7 +21,8 @@ class Tokenizer:
         if self.special_tokens:
             self.special_tokens = sorted(self.special_tokens, key=len, reverse=True)
             self.pattern = re.compile("|".join(re.escape(t) for t in self.special_tokens))
-        self.cache = {}
+        # self._hot_cache = {v: k for token_id, token_bytes in vocab.items()}
+        self._lru_cache = lru_cache(maxsize=cache_size)(self._encode_word)
 
     @classmethod
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
@@ -48,7 +53,7 @@ class Tokenizer:
             merges = tmp["merges"]
         return cls(vocab, merges, special_tokens)
     
-    def _encode_word(self, word: bytes) -> list[int]:
+    def _encode_word(self, word: bytes) -> tuple[int]:
         """
         Encode a single word into a list of token IDs based on the vocabulary and merges.
         """
@@ -104,7 +109,7 @@ class Tokenizer:
 
             tokens = new_tokens
 
-        return [self.bytes_to_id[t] for t in tokens]
+        return tuple(self.bytes_to_id[t] for t in tokens)
 
     def encode_without_special_tokens(self, text : str, start: int, end: int) -> list[int]:
         text_id_seq = []
@@ -112,12 +117,13 @@ class Tokenizer:
         for word in words:
             # print(f"Encoding word: {word.group()}")
             token_bytes = word.group().encode("utf-8")
-            if token_bytes in self.cache:
-                text_id_seq.extend(self.cache[token_bytes])
-            else:
-                word_id_seq = self._encode_word(token_bytes)
-                text_id_seq.extend(word_id_seq)
-                self.cache[token_bytes] = word_id_seq
+            # if token_bytes in self.cache:
+            #     text_id_seq.extend(self.cache[token_bytes])
+            # else:
+            #     word_id_seq = self._encode_word(token_bytes)
+            #     text_id_seq = text_id_seq + word_id_seq
+            #     self.cache[token_bytes] = word_id_seq
+            text_id_seq.extend(self._lru_cache(token_bytes))
         return text_id_seq
 
     def encode(self, text: str) -> list[int]:
@@ -197,23 +203,31 @@ class Tokenizer:
                     pos += mini_chunk_size
 
         return sorted(set(boundaries))
+    
     def _encode_for_parallel(self, file_path: str | os.PathLike, start: int, end: int) -> list[int]:
         with open(file_path, "rb") as f:
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
             return self.encode(chunk)
 
-    def encode_file_parallel(self, file_path: str | os.PathLike, num_processes: int = 4) -> list[int]:
-        boundaries = self._find_chunk_boundaries(file_path, num_processes)
+    def encode_file_parallel(self, file_path: str | os.PathLike, num_processes: int = 1) -> list[int]:
+        boundaries = self._find_chunk_boundaries(file_path, num_processes * 20)
 
         ret = []
-
+    
         with Pool(num_processes) as pool:
             results = pool.starmap(self._encode_for_parallel, [(file_path, start, end) for start, end in zip(boundaries, boundaries[1:])])
             for r in results:
                 ret.extend(r)
 
         return ret
+
+    # lru_cache 包装的绑定方法不能 pickle；macOS 默认用 spawn 启动子进程，需要以下两个方法
+    def __getstate__(self):
+        s = self.__dict__.copy(); s.pop("_lru_cache", None); return s
+    
+    def __setstate__(self, s):
+        self.__dict__.update(s); self._lru_cache = lru_cache(maxsize=300_000)(self._encode_word)
 
 def get_tokenizer(
     vocab: dict[int, bytes],
