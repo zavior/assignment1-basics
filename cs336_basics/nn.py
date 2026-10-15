@@ -87,3 +87,32 @@ class SwiGLU(torch.nn.Module):
         ret = einsum(gate, ret, "... seq ff, ... seq ff -> ... seq ff")
         ret = einsum(self.w2, ret, "model ff, ... seq ff -> ... seq model")
         return ret
+
+class RotaryPositionEmbedding(torch.nn.Module):
+    def __init__(self, 
+                 theta: float, 
+                 d_k: int, 
+                 max_seq_len: int, 
+                 device: torch.device | None = None) -> None:
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        self.device = device
+
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, device = device).float() / d_k))
+        pos = torch.arange(max_seq_len, device = device).float()
+        angles = einsum(pos, inv_freq, "seq, dk -> seq dk")
+        self.register_buffer("cos", angles.cos(), persistent = False)
+        self.register_buffer("sin", angles.sin(), persistent = False)
+
+    def forward(self, x: torch.Tensor, token_pos: torch.Tensor) -> torch.Tensor:
+        # x: (batch_size, sequence_length, d_k) or (sequence_length, d_k)
+        # token_pos: (..., sequence_length)
+
+        cos = self.cos[token_pos] # cos : (..., sequence_length, d_k/2)
+        sin = self.sin[token_pos] # sin : (..., sequence_length, d_k/2)
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        x_rotated = rearrange([x1 * cos - x2 * sin, x1 * sin + x2 * cos], "two ... seq dk -> ... seq (dk two)")
+        return x_rotated
+        
