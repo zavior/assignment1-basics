@@ -118,7 +118,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    from cs336_basics.nn import scaled_dot_product_attention
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -152,7 +153,13 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.nn import Multihead_self_attention
+    mha = Multihead_self_attention(d_model=d_model, num_heads=num_heads, with_rope=False)
+    mha.q_proj.weight.data = q_proj_weight
+    mha.k_proj.weight.data = k_proj_weight
+    mha.v_proj.weight.data = v_proj_weight
+    mha.out_proj.weight.data = o_proj_weight
+    return mha(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -192,7 +199,19 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.nn import Multihead_self_attention
+    mha = Multihead_self_attention(
+        d_model=d_model,
+        num_heads=num_heads,
+        with_rope=True,
+        max_seq_len=max_seq_len,
+        theta=theta
+    )
+    mha.q_proj.weight.data = q_proj_weight
+    mha.k_proj.weight.data = k_proj_weight
+    mha.v_proj.weight.data = v_proj_weight
+    mha.out_proj.weight.data = o_proj_weight
+    return mha(in_features, pos=token_positions)
 
 
 def run_rope(
@@ -454,8 +473,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    from cs336_basics.nn import Softmax
-    return Softmax(in_features, dim=dim)
+    from cs336_basics.nn import softmax
+    return softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(

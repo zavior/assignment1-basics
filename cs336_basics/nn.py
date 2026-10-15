@@ -117,8 +117,80 @@ class RotaryPositionEmbedding(torch.nn.Module):
         return x_rotated
         
 
-def Softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     max_val = torch.max(x, dim = dim, keepdim = True).values
     x_exp = torch.exp(x - max_val)
     x_exp_sum = torch.sum(x_exp, dim = dim, keepdim = True)
     return x_exp / x_exp_sum
+
+def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """
+        q: (batch_size, q_len, d_k)
+        k: (batch_size, k_len, d_k)
+        v: (batch_size, k_len, d_v)
+        mask: (batch_size, q_len, k_len) or None
+
+    Returns:
+        torch.Tensor: Output of the scaled dot-product attention with shape (batch_size, q_len, d_v).
+    """
+
+    att = einsum(q, k, "... q_len d_k, ... k_len d_k -> ... q_len k_len")
+    att = att / math.sqrt(q.shape[-1])
+
+    if mask is not None:
+        att = att.masked_fill(~mask, float("-inf"))
+    att = softmax(att, dim = -1)
+    att = einsum(att, v, "... q_len k_len, ... k_len d_v -> ... q_len d_v")
+
+    return att
+
+class Multihead_self_attention(torch.nn.Module):
+    def __init__(self, 
+                 d_model: int, 
+                 num_heads: int, 
+                 with_rope: bool = True,
+                 max_seq_len: int | None = None,
+                 theta: float | None = None,
+                 device: torch.device | None = None,
+                 dtype: torch.dtype | None = None,
+                 ) -> None:
+        super().__init__() 
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.dim_per_head = d_model // num_heads
+        self.with_rope = with_rope
+
+        self.rope = RotaryPositionEmbedding(theta = theta, d_k = self.dim_per_head, max_seq_len = max_seq_len, device=device) if with_rope else None
+
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.out_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+
+    def forward(self, x : torch.Tensor, pos : torch.Tensor | None = None) -> torch.Tensor:
+        # x: (batch_size, seq_len, d_model)
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = rearrange(q, "... seq (h d) -> ... h seq d", h = self.num_heads) # q : (... num_head seq_len dim_per_head)
+        k = rearrange(k, "... seq (h d) -> ... h seq d", h = self.num_heads) # k : (... num_head seq_len dim_per_head)
+        v = rearrange(v, "... seq (h d) -> ... h seq d", h = self.num_heads) # v : (... num_head seq_len dim_per_head)
+
+        if self.with_rope:
+            if pos is not None:
+                pos = rearrange(pos, "... seq -> ... 1 seq") # add a singleton dimension for the head axis
+                q = self.rope(q, token_pos = pos)
+                k = self.rope(k, token_pos = pos)
+            else:
+                raise ValueError("Position tensor 'pos' must be provided when using rotary position embedding.")
+
+        seq_len = x.shape[-2]
+        mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+        att = scaled_dot_product_attention(q, k, v, mask) 
+
+        att = rearrange(att, "... h seq d -> ... seq (h d)")
+        out = self.out_proj(att)
+        return out
