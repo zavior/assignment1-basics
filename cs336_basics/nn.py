@@ -116,3 +116,9 @@ class RotaryPositionEmbedding(torch.nn.Module):
         x_rotated = rearrange([x1 * cos - x2 * sin, x1 * sin + x2 * cos], "two ... seq dk -> ... seq (dk two)")
         return x_rotated
         
+
+def Softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    max_val = torch.max(x, dim = dim, keepdim = True).values
+    x_exp = torch.exp(x - max_val)
+    x_exp_sum = torch.sum(x_exp, dim = dim, keepdim = True)
+    return x_exp / x_exp_sum
