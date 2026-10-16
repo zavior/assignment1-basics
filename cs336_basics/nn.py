@@ -67,7 +67,7 @@ class SwiGLU(torch.nn.Module):
                  dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.d_model = d_model
-        self.d_ff = int((8 * d_model / 3) / 64 + 0.5)
+        self.d_ff = int((8 * d_model / 3) / 64 + 0.5) * 64
         self.w1 = torch.nn.Parameter(torch.empty((self.d_ff, d_model), device=device, dtype=dtype))
         self.w2 = torch.nn.Parameter(torch.empty((d_model, self.d_ff), device=device, dtype=dtype))
         self.w3 = torch.nn.Parameter(torch.empty((self.d_ff, d_model), device=device, dtype=dtype))
@@ -194,3 +194,36 @@ class Multihead_self_attention(torch.nn.Module):
         att = rearrange(att, "... h seq d -> ... seq (h d)")
         out = self.out_proj(att)
         return out
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 num_heads: int,
+                 d_ff: int,
+                 max_seq_len: int,
+                 theta: float,
+                 device: torch.device | None = None,
+                 dtype: torch.dtype | None = None,
+                 ) -> None:
+        super().__init__()
+
+        self.attn = Multihead_self_attention(
+            d_model=d_model,
+            num_heads=num_heads,
+            with_rope=True,
+            max_seq_len=max_seq_len,
+            theta=theta,
+            device=device,
+            dtype=dtype
+        )
+
+        self.ff = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+
+        self.rms_norm1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.rms_norm2 = RMSNorm(d_model, device=device, dtype=dtype)
+
+
+    def forward(self, x: torch.Tensor, pos: torch.Tensor | None = None) -> torch.Tensor:
+        y = x + self.attn(self.rms_norm1(x), pos=pos)
+        y = y + self.ff(self.rms_norm2(y))
+        return y
