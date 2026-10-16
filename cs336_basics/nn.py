@@ -1,11 +1,19 @@
 import torch, math
 from einops import rearrange, einsum
 
+
+def _as_weight_dict(state_dict):
+    """允许直接传一个 Tensor，视为 {"weight": tensor}。"""
+    if isinstance(state_dict, torch.Tensor):
+        return {"weight": state_dict}
+    return state_dict
+
+
 class Linear(torch.nn.Module):
-    def __init__(self, 
-                 in_features: int, 
-                 out_features: int, 
-                 device: torch.device | None = None, 
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 device: torch.device | None = None,
                  dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.in_features = in_features
@@ -17,11 +25,16 @@ class Linear(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return einsum(x, self.weight, "... i, o i -> ... o")
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        # 接受 {"weight": W} 或直接传 W，W 形状 (out_features, in_features)
+        return super().load_state_dict(_as_weight_dict(state_dict), strict=strict, assign=assign)
+
+
 class Embedding(torch.nn.Module):
-    def __init__(self, 
-                num_embeddings: int, 
-                embedding_dim: int, 
-                device: torch.device | None = None, 
+    def __init__(self,
+                num_embeddings: int,
+                embedding_dim: int,
+                device: torch.device | None = None,
                 dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -32,11 +45,16 @@ class Embedding(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight[x]
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        # 接受 {"weight": W} 或直接传 W，W 形状 (num_embeddings, embedding_dim)
+        return super().load_state_dict(_as_weight_dict(state_dict), strict=strict, assign=assign)
+
+
 class RMSNorm(torch.nn.Module):
-    def __init__(self, 
-                 d_model: int, 
+    def __init__(self,
+                 d_model: int,
                  eps: float = 1e-5,
-                 device: torch.device | None = None, 
+                 device: torch.device | None = None,
                  dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.d_model = d_model
@@ -53,6 +71,11 @@ class RMSNorm(torch.nn.Module):
 
         return x.to(in_type)
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        # 接受 {"weight": g} 或直接传 g，g 形状 (d_model,)
+        return super().load_state_dict(_as_weight_dict(state_dict), strict=strict, assign=assign)
+
+
 class SiLU(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -60,39 +83,33 @@ class SiLU(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(x)
 
+
 class SwiGLU(torch.nn.Module):
-    def __init__(self, 
-                 d_model: int, 
-                 device: torch.device | None = None, 
+    # state_dict keys: w1.weight (d_ff, d_model), w2.weight (d_model, d_ff), w3.weight (d_ff, d_model)
+    def __init__(self,
+                 d_model: int,
+                 d_ff: int | None = None,
+                 device: torch.device | None = None,
                  dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.d_model = d_model
-        self.d_ff = int((8 * d_model / 3) / 64 + 0.5) * 64
-        self.w1 = torch.nn.Parameter(torch.empty((self.d_ff, d_model), device=device, dtype=dtype))
-        self.w2 = torch.nn.Parameter(torch.empty((d_model, self.d_ff), device=device, dtype=dtype))
-        self.w3 = torch.nn.Parameter(torch.empty((self.d_ff, d_model), device=device, dtype=dtype))
+        # 默认 d_ff ≈ 8/3 * d_model，向上取到 64 的倍数
+        self.d_ff = d_ff if d_ff is not None else int(math.ceil(8 * d_model / 3 / 64)) * 64
+        self.w1 = Linear(d_model, self.d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(self.d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, self.d_ff, device=device, dtype=dtype)
         self.silu = SiLU()
 
-        std = math.sqrt(2 / (self.d_ff + d_model))
-        torch.nn.init.trunc_normal_(self.w1, mean=0.0, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.trunc_normal_(self.w2, mean=0.0, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.trunc_normal_(self.w3, mean=0.0, std=std, a=-3 * std, b=3 * std)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch_size, sequence_length, d_model) or (sequence_length, d_model)
-        gate = einsum(self.w1, x, "ff model, ... seq model -> ... seq ff")
-        gate = self.silu(gate)
+        # x: (..., seq, d_model)
+        return self.w2(self.silu(self.w1(x)) * self.w3(x))
 
-        ret = einsum(self.w3, x, "ff model, ... seq model -> ... seq ff")
-        ret = einsum(gate, ret, "... seq ff, ... seq ff -> ... seq ff")
-        ret = einsum(self.w2, ret, "model ff, ... seq ff -> ... seq model")
-        return ret
 
 class RotaryPositionEmbedding(torch.nn.Module):
-    def __init__(self, 
-                 theta: float, 
-                 d_k: int, 
-                 max_seq_len: int, 
+    def __init__(self,
+                 theta: float,
+                 d_k: int,
+                 max_seq_len: int,
                  device: torch.device | None = None) -> None:
         super().__init__()
         self.theta = theta
@@ -115,7 +132,7 @@ class RotaryPositionEmbedding(torch.nn.Module):
         x1, x2 = x[..., ::2], x[..., 1::2]
         x_rotated = rearrange([x1 * cos - x2 * sin, x1 * sin + x2 * cos], "two ... seq dk -> ... seq (dk two)")
         return x_rotated
-        
+
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     max_val = torch.max(x, dim = dim, keepdim = True).values
@@ -145,16 +162,17 @@ def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
     return att
 
 class Multihead_self_attention(torch.nn.Module):
-    def __init__(self, 
-                 d_model: int, 
-                 num_heads: int, 
+    # state_dict keys: q_proj.weight, k_proj.weight, v_proj.weight, output_proj.weight
+    def __init__(self,
+                 d_model: int,
+                 num_heads: int,
                  with_rope: bool = True,
                  max_seq_len: int | None = None,
                  theta: float | None = None,
                  device: torch.device | None = None,
                  dtype: torch.dtype | None = None,
                  ) -> None:
-        super().__init__() 
+        super().__init__()
 
         self.d_model = d_model
         self.num_heads = num_heads
@@ -166,7 +184,7 @@ class Multihead_self_attention(torch.nn.Module):
         self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.out_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
 
     def forward(self, x : torch.Tensor, pos : torch.Tensor | None = None) -> torch.Tensor:
         # x: (batch_size, seq_len, d_model)
@@ -189,13 +207,15 @@ class Multihead_self_attention(torch.nn.Module):
 
         seq_len = x.shape[-2]
         mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
-        att = scaled_dot_product_attention(q, k, v, mask) 
+        att = scaled_dot_product_attention(q, k, v, mask)
 
         att = rearrange(att, "... h seq d -> ... seq (h d)")
-        out = self.out_proj(att)
+        out = self.output_proj(att)
         return out
 
+
 class TransformerBlock(torch.nn.Module):
+    # state_dict keys: attn.{q,k,v,output}_proj.weight, ln1.weight, ln2.weight, ffn.w{1,2,3}.weight
     def __init__(self,
                  d_model: int,
                  num_heads: int,
@@ -217,13 +237,13 @@ class TransformerBlock(torch.nn.Module):
             dtype=dtype
         )
 
-        self.ff = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
 
-        self.rms_norm1 = RMSNorm(d_model, device=device, dtype=dtype)
-        self.rms_norm2 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
 
 
     def forward(self, x: torch.Tensor, pos: torch.Tensor | None = None) -> torch.Tensor:
-        y = x + self.attn(self.rms_norm1(x), pos=pos)
-        y = y + self.ff(self.rms_norm2(y))
+        y = x + self.attn(self.ln1(x), pos=pos)
+        y = y + self.ffn(self.ln2(y))
         return y
