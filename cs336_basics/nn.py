@@ -200,6 +200,7 @@ class Multihead_self_attention(torch.nn.Module):
         if self.with_rope:
             if pos is not None:
                 pos = rearrange(pos, "... seq -> ... 1 seq") # add a singleton dimension for the head axis
+            
                 q = self.rope(q, token_pos = pos)
                 k = self.rope(k, token_pos = pos)
             else:
@@ -247,3 +248,43 @@ class TransformerBlock(torch.nn.Module):
         y = x + self.attn(self.ln1(x), pos=pos)
         y = y + self.ffn(self.ln2(y))
         return y
+
+class TransformerLM(torch.nn.Module):
+    def __init__(self,
+                vocab_size: int,
+                context_length: int,
+                d_model: int,
+                num_layers: int,
+                num_heads: int,
+                d_ff: int,
+                rope_theta: float,
+                device: torch.device | None = None,
+                dtype: torch.dtype | None = None,
+                ) -> None:
+        super().__init__()
+
+        self.layers = torch.nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                max_seq_len=context_length,
+                theta=rope_theta,
+                device=device,
+                dtype=dtype
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+
+        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, pos: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.token_embeddings(x)
+        for layer in self.layers:
+            x = layer(x, pos=pos)
+        x = self.ln_final(x)
+        x = self.lm_head(x)
+        return x
