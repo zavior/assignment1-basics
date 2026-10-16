@@ -156,6 +156,12 @@ def softmax(x: Float[Tensor, "..."], dim: int = -1) -> Float[Tensor, "..."]:
     x_exp_sum = torch.sum(x_exp, dim=dim, keepdim=True)
     return x_exp / x_exp_sum
 
+def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], 
+                  targets : Int[Tensor, " batch_size"]) -> torch.Tensor:
+    logsumexp = inputs.logsumexp(dim=-1, keepdim=True)
+    target_logits = torch.gather(inputs, -1, targets.unsqueeze(dim=-1)).squeeze(dim=-1)
+
+    return torch.mean(logsumexp.squeeze(dim=-1) - target_logits)
 
 def scaled_dot_product_attention(
     q: Float[Tensor, "... q_len d_k"],
@@ -310,3 +316,4 @@ class TransformerLM(torch.nn.Module):
         x = self.ln_final(x)
         x = self.lm_head(x)
         return x
+
